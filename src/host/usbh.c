@@ -277,6 +277,30 @@ CFG_TUH_MEM_SECTION struct {
 static uint32_t _ctrl_xfer_start_ms;
 static void usbh_control_xfer_watchdog(void);
 
+// GP2040-CE: only one control transfer runs at a time, and tuh_control_xfer()
+// used to reject a request outright while the slot was busy. The enumeration
+// and hub state machines treat a rejected submit as fatal and silently stop
+// (enumeration stays "in progress" forever, the hub stops reporting port
+// changes), so any other control-transfer user -- e.g. an application sending
+// HID feature reports -- could wedge the host. Asynchronous requests made
+// while the slot is busy are now queued and started when it frees up.
+#ifndef CFG_TUH_CONTROL_PENDING_QUEUE_SZ
+#define CFG_TUH_CONTROL_PENDING_QUEUE_SZ 8
+#endif
+typedef struct {
+  tusb_control_request_t setup;
+  uint8_t* buffer;
+  tuh_xfer_cb_t complete_cb;
+  uintptr_t user_data;
+  uint8_t daddr;
+  bool stale;   // target device was removed while queued
+} usbh_pending_ctrl_t;
+static usbh_pending_ctrl_t _ctrl_pending[CFG_TUH_CONTROL_PENDING_QUEUE_SZ];
+static uint8_t _ctrl_pending_head;
+static uint8_t _ctrl_pending_count;
+static void control_xfer_dispatch_pending(void);
+static void control_xfer_mark_pending_stale(uint8_t daddr);
+
 //------------- Helper Function -------------//
 
 TU_ATTR_ALWAYS_INLINE static inline usbh_device_t* get_device(uint8_t dev_addr) {
@@ -502,6 +526,7 @@ void tuh_task_ext(uint32_t timeout_ms, bool in_isr) {
   if (!tuh_inited()) return;
 
   usbh_control_xfer_watchdog();
+  control_xfer_dispatch_pending();
 
   // Loop until there is no more events in the queue
   while (1) {
@@ -637,11 +662,22 @@ bool tuh_control_xfer (tuh_xfer_t* xfer) {
     if (dev && dev->connected == 0) return false;
   }
 
-  // pre-check to help reducing mutex lock
-  TU_VERIFY(_ctrl_xfer.stage == CONTROL_STAGE_IDLE);
   (void) osal_mutex_lock(_usbh_mutex, OSAL_TIMEOUT_WAIT_FOREVER);
 
   bool const is_idle = (_ctrl_xfer.stage == CONTROL_STAGE_IDLE);
+  bool is_queued = false;
+  if (!is_idle && xfer->complete_cb && _ctrl_pending_count < CFG_TUH_CONTROL_PENDING_QUEUE_SZ) {
+    // Slot busy: queue asynchronous requests; control_xfer_dispatch_pending() starts them.
+    uint8_t const idx = (uint8_t) ((_ctrl_pending_head + _ctrl_pending_count) % CFG_TUH_CONTROL_PENDING_QUEUE_SZ);
+    _ctrl_pending[idx].setup       = (*xfer->setup);
+    _ctrl_pending[idx].buffer      = xfer->buffer;
+    _ctrl_pending[idx].complete_cb = xfer->complete_cb;
+    _ctrl_pending[idx].user_data   = xfer->user_data;
+    _ctrl_pending[idx].daddr       = daddr;
+    _ctrl_pending[idx].stale       = false;
+    _ctrl_pending_count++;
+    is_queued = true;
+  }
   if (is_idle) {
     _ctrl_xfer.stage       = CONTROL_STAGE_SETUP;
     _ctrl_xfer.daddr       = daddr;
@@ -656,6 +692,7 @@ bool tuh_control_xfer (tuh_xfer_t* xfer) {
 
   (void) osal_mutex_unlock(_usbh_mutex);
 
+  if (is_queued) return true;
   TU_VERIFY(is_idle);
   const uint8_t rhport = usbh_get_rhport(daddr);
 
@@ -723,6 +760,65 @@ static void _control_xfer_complete(uint8_t daddr, xfer_result_t result) {
 
   if (xfer_temp.complete_cb) {
     xfer_temp.complete_cb(&xfer_temp);
+  }
+}
+
+// GP2040-CE: see CFG_TUH_CONTROL_PENDING_QUEUE_SZ.
+static void control_xfer_fail_pending(usbh_pending_ctrl_t const* entry) {
+  if (!entry->complete_cb) return;
+  tuh_xfer_t xfer = {
+    .daddr       = entry->daddr,
+    .ep_addr     = 0,
+    .result      = XFER_RESULT_FAILED,
+    .setup       = &entry->setup,
+    .actual_len  = 0,
+    .buffer      = entry->buffer,
+    .complete_cb = entry->complete_cb,
+    .user_data   = entry->user_data
+  };
+  entry->complete_cb(&xfer);
+}
+
+static void control_xfer_dispatch_pending(void) {
+  while (_ctrl_xfer.stage == CONTROL_STAGE_IDLE && _ctrl_pending_count > 0) {
+    (void) osal_mutex_lock(_usbh_mutex, OSAL_TIMEOUT_WAIT_FOREVER);
+    usbh_pending_ctrl_t const entry = _ctrl_pending[_ctrl_pending_head];
+    _ctrl_pending_head = (uint8_t) ((_ctrl_pending_head + 1) % CFG_TUH_CONTROL_PENDING_QUEUE_SZ);
+    _ctrl_pending_count--;
+    (void) osal_mutex_unlock(_usbh_mutex);
+
+    bool alive;
+    if (entry.daddr == 0) {
+      alive = _dev0.enumerating;
+    } else {
+      usbh_device_t const* dev = get_device(entry.daddr);
+      alive = dev && dev->connected;
+    }
+
+    tuh_xfer_t xfer = {
+      .daddr       = entry.daddr,
+      .ep_addr     = 0,
+      .setup       = &entry.setup,
+      .buffer      = entry.buffer,
+      .complete_cb = entry.complete_cb,
+      .user_data   = entry.user_data
+    };
+    // Drop requests for devices that are gone without calling back: their
+    // state machines were torn down on removal, and a dev0 callback could
+    // otherwise act on a different device now being enumerated.
+    if (entry.stale || !alive) continue;
+
+    // Slot is idle here, so tuh_control_xfer() starts it rather than re-queuing.
+    if (!tuh_control_xfer(&xfer)) {
+      control_xfer_fail_pending(&entry);
+    }
+  }
+}
+
+static void control_xfer_mark_pending_stale(uint8_t daddr) {
+  for (uint8_t i = 0; i < _ctrl_pending_count; i++) {
+    usbh_pending_ctrl_t* entry = &_ctrl_pending[(_ctrl_pending_head + i) % CFG_TUH_CONTROL_PENDING_QUEUE_SZ];
+    if (entry->daddr == daddr) entry->stale = true;
   }
 }
 
@@ -1280,6 +1376,7 @@ static void release_dev0_if_removed(uint8_t rhport, uint8_t hub_addr, uint8_t hu
 
   TU_LOG_USBH("[%u:%u:%u] release enumerating dev0\r\n", rhport, hub_addr, hub_port);
   _dev0.enumerating = 0;
+  control_xfer_mark_pending_stale(0);
   if (dev0_busy) {
     (void) hcd_edpt_abort_xfer(rhport, 0, 0x00);
     (void) hcd_edpt_abort_xfer(rhport, 0, 0x80);
@@ -1321,6 +1418,7 @@ static void process_removing_device(uint8_t rhport, uint8_t hub_addr, uint8_t hu
 
         hcd_device_close(rhport, daddr);
         clear_device(dev);
+        control_xfer_mark_pending_stale(daddr);
 
         // abort on-going control xfer on this device if any
         if (_ctrl_xfer.daddr == daddr) _set_control_xfer_stage(CONTROL_STAGE_IDLE);
