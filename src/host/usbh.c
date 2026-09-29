@@ -266,6 +266,17 @@ CFG_TUH_MEM_SECTION struct {
   volatile uint16_t actual_len;
 }_ctrl_xfer;
 
+// GP2040-CE: control transfers have no timeout in this TinyUSB version and
+// Pico-PIO-USB retries NAKs forever, so a device that keeps NAKing holds the
+// single control slot indefinitely and wedges the whole host (hubs can no
+// longer report port changes, enumeration never finishes). Abort a control
+// transfer that has not completed within this many milliseconds.
+#ifndef CFG_TUH_CONTROL_XFER_TIMEOUT_MS
+#define CFG_TUH_CONTROL_XFER_TIMEOUT_MS 1500
+#endif
+static uint32_t _ctrl_xfer_start_ms;
+static void usbh_control_xfer_watchdog(void);
+
 //------------- Helper Function -------------//
 
 TU_ATTR_ALWAYS_INLINE static inline usbh_device_t* get_device(uint8_t dev_addr) {
@@ -490,6 +501,8 @@ void tuh_task_ext(uint32_t timeout_ms, bool in_isr) {
   // Skip if stack is not initialized
   if (!tuh_inited()) return;
 
+  usbh_control_xfer_watchdog();
+
   // Loop until there is no more events in the queue
   while (1) {
     hcd_event_t event;
@@ -633,6 +646,7 @@ bool tuh_control_xfer (tuh_xfer_t* xfer) {
     _ctrl_xfer.stage       = CONTROL_STAGE_SETUP;
     _ctrl_xfer.daddr       = daddr;
     _ctrl_xfer.actual_len  = 0;
+    _ctrl_xfer_start_ms    = hcd_frame_number(_usbh_controller);
 
     _ctrl_xfer.request     = (*xfer->setup);
     _ctrl_xfer.buffer      = xfer->buffer;
@@ -669,7 +683,7 @@ bool tuh_control_xfer (tuh_xfer_t* xfer) {
       if (tuh_task_event_ready()) {
         tuh_task();
       }
-      // TODO probably some timeout to prevent hanged
+      usbh_control_xfer_watchdog();
     }
 
     // update transfer result, user_data is expected to point to xfer_result_t
@@ -712,11 +726,38 @@ static void _control_xfer_complete(uint8_t daddr, xfer_result_t result) {
   }
 }
 
+// GP2040-CE: see CFG_TUH_CONTROL_XFER_TIMEOUT_MS.
+static void usbh_control_xfer_watchdog(void) {
+  if (_ctrl_xfer.stage == CONTROL_STAGE_IDLE) return;
+
+  uint32_t const elapsed = hcd_frame_number(_usbh_controller) - _ctrl_xfer_start_ms;
+  if (elapsed < CFG_TUH_CONTROL_XFER_TIMEOUT_MS) return;
+
+  uint8_t const daddr = _ctrl_xfer.daddr;
+  uint8_t const rhport = usbh_get_rhport(daddr);
+
+  // Cancel it in the HCD. If nothing was active there, a completion may still
+  // be queued; give it one more window before forcing the slot free, so a
+  // late completion cannot land on a newly started transfer.
+  bool aborted = hcd_edpt_abort_xfer(rhport, daddr, 0x00);
+  aborted = hcd_edpt_abort_xfer(rhport, daddr, 0x80) || aborted;
+  if (!aborted && elapsed < 2 * CFG_TUH_CONTROL_XFER_TIMEOUT_MS) return;
+
+  TU_LOG_USBH("[%u:%u] Control transfer timed out\r\n", rhport, daddr);
+  _control_xfer_complete(daddr, XFER_RESULT_TIMEOUT);
+}
+
 static bool usbh_control_xfer_cb (uint8_t daddr, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes) {
   (void) ep_addr;
 
   const uint8_t rhport = usbh_get_rhport(daddr);
   tusb_control_request_t const * request = &_ctrl_xfer.request;
+
+  // Drop stale completions: the slot was already released (watchdog abort or
+  // device removal) or now belongs to another device's transfer.
+  if (_ctrl_xfer.stage == CONTROL_STAGE_IDLE || _ctrl_xfer.daddr != daddr) {
+    return true;
+  }
 
   if (XFER_RESULT_SUCCESS != result) {
     TU_LOG_USBH("[%u:%u] Control %s, xferred_bytes = %" PRIu32 "\r\n", rhport, daddr, result == XFER_RESULT_STALLED ? "STALLED" : "FAILED", xferred_bytes);
@@ -1225,12 +1266,35 @@ TU_ATTR_ALWAYS_INLINE static inline bool is_hub_addr(uint8_t daddr) {
 //  }
 //}
 
+// GP2040-CE: dev0 (a device still being enumerated, no address yet) is not in
+// _usbh_devices, so removing its port or parent hub never released it. The
+// in-flight dev0 control transfer then held the control slot and
+// _dev0.enumerating stayed set, deferring every later attach until reboot.
+static void release_dev0_if_removed(uint8_t rhport, uint8_t hub_addr, uint8_t hub_port) {
+  if (_dev0.rhport != rhport) return;
+  if (hub_addr != 0 && _dev0.hub_addr != hub_addr) return;
+  if (hub_port != 0 && _dev0.hub_port != hub_port) return;
+
+  bool const dev0_busy = (_ctrl_xfer.stage != CONTROL_STAGE_IDLE) && (_ctrl_xfer.daddr == 0);
+  if (!_dev0.enumerating && !dev0_busy) return;
+
+  TU_LOG_USBH("[%u:%u:%u] release enumerating dev0\r\n", rhport, hub_addr, hub_port);
+  _dev0.enumerating = 0;
+  if (dev0_busy) {
+    (void) hcd_edpt_abort_xfer(rhport, 0, 0x00);
+    (void) hcd_edpt_abort_xfer(rhport, 0, 0x80);
+    _set_control_xfer_stage(CONTROL_STAGE_IDLE);
+  }
+  hcd_device_close(rhport, 0);
+}
+
 // a device unplugged from rhport:hub_addr:hub_port
 static void process_removing_device(uint8_t rhport, uint8_t hub_addr, uint8_t hub_port) {
   //------------- find the all devices (star-network) under port that is unplugged -------------//
   // TODO mark as disconnected in ISR, also handle dev0
   uint32_t removing_hubs = 0;
   do {
+    release_dev0_if_removed(rhport, hub_addr, hub_port);
     for (uint8_t dev_id = 0; dev_id < TOTAL_DEVICES; dev_id++) {
       usbh_device_t* dev = &_usbh_devices[dev_id];
       uint8_t const daddr = dev_id + 1;

@@ -374,13 +374,21 @@ bool hub_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uint32
 
 static void hub_clear_feature_complete_stub(tuh_xfer_t* xfer)
 {
-  TU_ASSERT(xfer->result == XFER_RESULT_SUCCESS, );
+  if (xfer->result != XFER_RESULT_SUCCESS) {
+    // Re-arm the status pipe, otherwise this hub never reports another change
+    hub_edpt_status_xfer(xfer->daddr);
+    return;
+  }
   hub_edpt_status_xfer(xfer->daddr);
 }
 
 static void hub_get_status_complete (tuh_xfer_t* xfer)
 {
-  TU_ASSERT(xfer->result == XFER_RESULT_SUCCESS, );
+  if (xfer->result != XFER_RESULT_SUCCESS) {
+    // Re-arm the status pipe, otherwise this hub never reports another change
+    hub_edpt_status_xfer(xfer->daddr);
+    return;
+  }
 
   uint8_t const daddr = xfer->daddr;
   hub_interface_t* p_hub = get_itf(daddr);
@@ -403,7 +411,11 @@ static void hub_get_status_complete (tuh_xfer_t* xfer)
 
 static void hub_port_get_status_complete (tuh_xfer_t* xfer)
 {
-  TU_ASSERT(xfer->result == XFER_RESULT_SUCCESS, );
+  if (xfer->result != XFER_RESULT_SUCCESS) {
+    // Re-arm the status pipe, otherwise this hub never reports another change
+    hub_edpt_status_xfer(xfer->daddr);
+    return;
+  }
 
   uint8_t const daddr = xfer->daddr;
   hub_interface_t* p_hub = get_itf(daddr);
@@ -450,7 +462,11 @@ static void hub_port_get_status_complete (tuh_xfer_t* xfer)
 
 static void connection_clear_conn_change_complete (tuh_xfer_t* xfer)
 {
-  TU_ASSERT(xfer->result == XFER_RESULT_SUCCESS, );
+  if (xfer->result != XFER_RESULT_SUCCESS) {
+    // Re-arm the status pipe, otherwise this hub never reports another change
+    hub_edpt_status_xfer(xfer->daddr);
+    return;
+  }
 
   uint8_t const daddr = xfer->daddr;
   hub_interface_t* p_hub = get_itf(daddr);
@@ -480,7 +496,11 @@ static void connection_clear_conn_change_complete (tuh_xfer_t* xfer)
 
 static void connection_port_reset_complete (tuh_xfer_t* xfer)
 {
-  TU_ASSERT(xfer->result == XFER_RESULT_SUCCESS, );
+  if (xfer->result != XFER_RESULT_SUCCESS) {
+    // Re-arm the status pipe, otherwise this hub never reports another change
+    hub_edpt_status_xfer(xfer->daddr);
+    return;
+  }
 
   uint8_t const daddr = xfer->daddr;
   // hub_interface_t* p_hub = get_itf(daddr);
